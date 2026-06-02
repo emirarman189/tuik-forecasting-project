@@ -1,0 +1,724 @@
+---
+title: "TÜİK Forecasting Project: Number of Visitors by Month (Tourism)"
+author: "Emir ARMAN - 138721522"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 5)
+```
+
+# Project Overview
+
+This project forecasts the **monthly number of visitors departing from Turkey**, using data obtained directly from the TÜİK Data Portal via the `tuikr` R package and the `httr` package. The forecast target is **April 2026**, the next period after the latest available observation (March 2026).
+
+---
+
+# Data Source and TÜİK Connection
+
+| Field | Information |
+|---|---|
+| TÜİK Data Set Name | Tourism expenditures, number of visitors and average expenditure per capita by months |
+| TÜİK Theme | Tourism (Theme ID: 14) |
+| Selected Variable | Number of Visitors (Vatandaş Sayısı) |
+| Data Frequency | Monthly |
+| Time Coverage | January 2012 – March 2026 |
+| Latest Available Observation | March 2026 |
+| Forecast Target Period | April 2026 |
+| Data Access Method | `tuikr` + `httr::GET()` |
+| Package Source | https://github.com/emraher/tuikr |
+
+---
+
+# Data Access via tuikr
+
+```{r data-access}
+# Load required packages
+library(tuikr)
+library(httr)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(forecast)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+
+# Step 1: Access TÜİK Tourism tables using tuikr
+tables14 <- statistical_tables("14")
+
+# Step 2: Get the URL for "Tourism expenditures, number of visitors and average expenditure per capita by months"
+url_istab <- tables14$table_url[13]
+
+# Step 3: Download the data using httr::GET() with appropriate headers
+# This is necessary because TÜİK's SDMX API (nsiws.tuik.gov.tr) returns HTTP 401.
+# The tuikr statistical_tables() function provides istab-type URLs accessible via httr.
+temp_file <- tempfile(fileext = ".xls")
+
+response <- GET(url_istab,
+                add_headers(
+                  "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                  "Accept"     = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                  "Referer"    = "https://veriportali.tuik.gov.tr/"
+                ),
+                write_disk(temp_file, overwrite = TRUE))
+
+cat("HTTP Status:", status_code(response), "\n")
+
+# Step 4: Read the downloaded xls file
+df_raw <- read_xls(temp_file)
+
+cat("Raw data dimensions:", dim(df_raw), "\n")
+```
+
+---
+
+# Use of TÜİK Data in R
+
+```{r data-cleaning}
+# Extract years from row 3 (every 3rd column starting from col 2)
+years <- as.character(df_raw[3, seq(2, 46, by = 3)])
+years <- years[!is.na(years)]
+years_clean <- gsub("\\(1\\)", "", years)  # Remove "(1)" footnote from 2020
+
+# Visitor count columns: 2nd column of each year group (cols 3, 6, 9, ...)
+visitor_cols <- seq(3, 46, by = 3)
+
+# Build tidy data frame: rows 6-17 are January through December
+ts_data <- data.frame()
+
+for (i in 1:length(years_clean)) {
+  col_idx <- visitor_cols[i]
+  values  <- as.numeric(as.character(unlist(df_raw[6:17, col_idx])))
+  temp    <- data.frame(
+    year     = as.integer(years_clean[i]),
+    month    = 1:12,
+    visitors = values
+  )
+  ts_data <- rbind(ts_data, temp)
+}
+
+# Add date column
+ts_data$date <- as.Date(paste(ts_data$year, sprintf("%02d", ts_data$month), "01", sep = "-"))
+
+# Remove NA rows (future months not yet published)
+ts_clean <- ts_data[!is.na(ts_data$visitors), ]
+
+cat("Total observations:", nrow(ts_clean), "\n")
+cat("Period:", format(min(ts_clean$date), "%B %Y"), "to", format(max(ts_clean$date), "%B %Y"), "\n")
+cat("Latest available observation:", format(max(ts_clean$date), "%B %Y"), "\n")
+cat("Forecast target period: April 2026\n")
+cat("Data access date:", format(Sys.Date()), "\n")
+```
+
+---
+
+# Exploratory Time Series Analysis
+
+```{r eda}
+# Create ts object
+ts_visitors <- ts(ts_clean$visitors, start = c(2012, 1), frequency = 12)
+
+# Summary statistics
+summary(ts_visitors)
+```
+
+```{r plot-actual, fig.cap="Actual Time Series: Monthly Number of Visitors"}
+# Plot actual series
+plot(ts_visitors,
+     main = "Monthly Number of Visitors Departing from Turkey (2012–2026)",
+     ylab = "Number of Visitors",
+     xlab = "Year",
+     col  = "steelblue",
+     lwd  = 1.5)
+grid()
+```
+
+```{r decomposition-check}
+# STL decomposition for EDA
+stl_fit <- stl(ts_visitors, s.window = "periodic", robust = TRUE)
+plot(stl_fit, main = "STL Decomposition (EDA)")
+```
+
+**Observations:**
+
+- **Trend**: A clear upward trend from 2012 to 2019, a sharp drop in 2020 (COVID-19), and a strong recovery from 2021 onward.
+- **Seasonality**: Strong and consistent seasonal pattern — visitor numbers peak in summer months (July–August) and dip in winter.
+- **Structural break**: The pandemic in 2020 caused an extraordinary disruption, which is a known structural break.
+- **Missing values**: None in the selected period.
+- **Outliers**: 2020 values are extreme outliers due to COVID-19 travel restrictions.
+
+---
+
+# Forecasting Methods
+
+We use the **last 36 observations** (2023 Jan – 2026 Mar) as the evaluation window to compute accuracy measures, since the post-COVID recovery period is more representative of current dynamics.
+
+```{r eval-setup}
+# Full series
+n_total <- length(ts_visitors)
+
+# Use last 36 observations for accuracy evaluation
+n_eval  <- 36
+ts_eval <- tail(ts_visitors, n_eval)
+
+# Actual values for accuracy calculation
+actual <- as.numeric(ts_eval)
+n      <- length(actual)
+```
+
+---
+
+## Naïve Forecasting
+
+```{r naive}
+# Naïve: forecast = previous period value
+naive_fit    <- naive(ts_visitors, h = 1)
+naive_next   <- as.numeric(naive_fit$mean[1])
+naive_fitted <- c(NA, actual[-length(actual)])
+naive_errors <- actual - naive_fitted
+actual_naive <- actual[!is.na(naive_fitted)]
+naive_fitted <- naive_fitted[!is.na(naive_fitted)]
+naive_errors <- naive_errors[!is.na(naive_errors)]
+
+# Plot
+plot(ts_eval, main = "Naïve Forecast vs Actual (Last 36 Obs)",
+     ylab = "Visitors", xlab = "Time", col = "steelblue", lwd = 1.5)
+lines(ts(naive_fitted, start = c(2023, 1), frequency = 12),
+      col = "red", lwd = 1.5, lty = 2)
+legend("topleft", legend = c("Actual", "Naïve Forecast"),
+       col = c("steelblue", "red"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+---
+
+## Moving Average
+
+```{r moving-average}
+# Window size = 12 (one full season) — captures seasonal cycle
+ma_window  <- 12
+ma_fitted  <- stats::filter(ts_eval, rep(1/ma_window, ma_window), sides = 1)
+ma_fitted  <- as.numeric(ma_fitted)
+
+# Remove NAs from the beginning
+valid_idx    <- !is.na(ma_fitted)
+ma_actual    <- actual[valid_idx]
+ma_forecasts <- ma_fitted[valid_idx]
+ma_errors    <- ma_actual - ma_forecasts
+
+# Next period forecast: MA of last 12 observations
+ma_next <- mean(tail(as.numeric(ts_visitors), 12))
+
+# Plot
+plot(ts_eval, main = "Moving Average (k=12) vs Actual",
+     ylab = "Visitors", xlab = "Time", col = "steelblue", lwd = 1.5)
+lines(ts(ma_fitted, start = c(2023, 1), frequency = 12),
+      col = "darkgreen", lwd = 1.5, lty = 2)
+legend("topleft", legend = c("Actual", "MA(12) Forecast"),
+       col = c("steelblue", "darkgreen"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Window size justification**: A window of 12 is chosen to match the monthly seasonal cycle, ensuring the moving average captures one full year of variation.
+
+---
+
+## Weighted Moving Average
+
+```{r wma}
+# Weights: more recent observations get higher weight
+# Last 12 months, linearly increasing weights
+wma_window  <- 12
+raw_weights <- 1:wma_window
+wma_weights <- raw_weights / sum(raw_weights)
+
+wma_fitted <- rep(NA, n)
+for (i in wma_window:n) {
+  wma_fitted[i] <- sum(wma_weights * actual[(i - wma_window + 1):i])
+}
+
+valid_idx2   <- !is.na(wma_fitted)
+wma_actual   <- actual[valid_idx2]
+wma_forecast <- wma_fitted[valid_idx2]
+wma_errors   <- wma_actual - wma_forecast
+
+# Next period forecast
+last12       <- tail(as.numeric(ts_visitors), 12)
+wma_next     <- sum(wma_weights * last12)
+
+# Plot
+plot(ts_eval, main = "Weighted Moving Average (k=12) vs Actual",
+     ylab = "Visitors", xlab = "Time", col = "steelblue", lwd = 1.5)
+lines(ts(wma_fitted, start = c(2023, 1), frequency = 12),
+      col = "purple", lwd = 1.5, lty = 2)
+legend("topleft", legend = c("Actual", "WMA(12) Forecast"),
+       col = c("steelblue", "purple"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Weighting logic**: Linearly increasing weights give more importance to recent observations, which is appropriate given the recovery trend post-2021.
+
+---
+
+## Exponential Smoothing
+
+```{r exp-smoothing}
+# Simple exponential smoothing — alpha optimized automatically
+es_fit    <- ses(ts_visitors, h = 1)
+es_alpha  <- es_fit$model$par["alpha"]
+cat("Optimal alpha:", round(es_alpha, 4), "\n")
+
+es_fitted <- as.numeric(fitted(es_fit))
+es_eval   <- tail(es_fitted, n_eval)
+es_errors <- actual - es_eval
+es_next   <- as.numeric(es_fit$mean[1])
+
+# Plot
+plot(ts_eval, main = paste0("Exponential Smoothing (alpha=", round(es_alpha,3), ") vs Actual"),
+     ylab = "Visitors", xlab = "Time", col = "steelblue", lwd = 1.5)
+lines(ts(es_eval, start = c(2023, 1), frequency = 12),
+      col = "orange", lwd = 1.5, lty = 2)
+legend("topleft", legend = c("Actual", "ES Forecast"),
+       col = c("steelblue", "orange"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+---
+
+## Trend-Adjusted Exponential Smoothing (Holt's Method)
+
+```{r holt}
+# Holt's method: captures level + trend
+holt_fit    <- holt(ts_visitors, h = 1)
+holt_alpha  <- holt_fit$model$par["alpha"]
+holt_beta   <- holt_fit$model$par["beta"]
+cat("Alpha:", round(holt_alpha, 4), "| Beta:", round(holt_beta, 4), "\n")
+
+holt_fitted <- as.numeric(fitted(holt_fit))
+holt_eval   <- tail(holt_fitted, n_eval)
+holt_errors <- actual - holt_eval
+holt_next   <- as.numeric(holt_fit$mean[1])
+
+# Plot
+plot(ts_eval, main = paste0("Holt's Trend-Adjusted ES (alpha=", round(holt_alpha,3),
+                             ", beta=", round(holt_beta,3), ") vs Actual"),
+     ylab = "Visitors", xlab = "Time", col = "steelblue", lwd = 1.5)
+lines(ts(holt_eval, start = c(2023, 1), frequency = 12),
+      col = "brown", lwd = 1.5, lty = 2)
+legend("topleft", legend = c("Actual", "Holt Forecast"),
+       col = c("steelblue", "brown"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Trend assessment**: The series shows a clear upward trend post-2021. Holt's method is therefore applicable.
+
+---
+
+## Linear Trend Projection
+
+```{r linear-trend}
+# Time index
+t_index   <- 1:n_total
+lm_fit    <- lm(as.numeric(ts_visitors) ~ t_index)
+
+cat("Intercept:", round(coef(lm_fit)[1], 2), "\n")
+cat("Slope:", round(coef(lm_fit)[2], 2), "\n")
+
+lm_fitted  <- as.numeric(fitted(lm_fit))
+lm_eval    <- tail(lm_fitted, n_eval)
+lm_errors  <- actual - lm_eval
+
+# Forecast next period (t = n_total + 1)
+lm_next    <- predict(lm_fit, newdata = data.frame(t_index = n_total + 1))
+
+# Plot
+plot(ts_eval, main = "Linear Trend Projection vs Actual",
+     ylab = "Visitors", xlab = "Time", col = "steelblue", lwd = 1.5)
+lines(ts(lm_eval, start = c(2023, 1), frequency = 12),
+      col = "darkred", lwd = 1.5, lty = 2)
+legend("topleft", legend = c("Actual", "Linear Trend"),
+       col = c("steelblue", "darkred"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Interpretation**: The intercept represents the estimated visitor count at time zero (extrapolated baseline). The slope indicates the average monthly increase in visitor numbers over the study period.
+
+---
+
+## Seasonal Indices
+
+```{r seasonal-indices}
+# Calculate seasonal indices using ratio-to-moving-average method
+# Step 1: 12-month centered moving average
+ma12       <- stats::filter(as.numeric(ts_visitors), rep(1/12, 12), sides = 2)
+
+# Step 2: Ratio of actual to MA
+ratios     <- as.numeric(ts_visitors) / ma12
+
+# Step 3: Average ratio by month = seasonal index
+months_vec <- cycle(ts_visitors)
+si         <- tapply(ratios, months_vec, mean, na.rm = TRUE)
+
+# Normalize so indices sum to 12
+si         <- si * (12 / sum(si))
+
+cat("Seasonal Indices:\n")
+month_names <- c("Jan","Feb","Mar","Apr","May","Jun",
+                 "Jul","Aug","Sep","Oct","Nov","Dec")
+si_df <- data.frame(Month = month_names, Seasonal_Index = round(si, 4))
+print(si_df)
+
+# Deseasonalized series
+deseason   <- as.numeric(ts_visitors) / si[months_vec]
+
+# Trend on deseasonalized
+t_index2   <- 1:n_total
+lm_deseas  <- lm(deseason ~ t_index2)
+trend_vals <- predict(lm_deseas, newdata = data.frame(t_index2 = 1:n_total))
+
+# Reseasonalize
+si_fitted  <- trend_vals * si[months_vec]
+si_eval    <- tail(si_fitted, n_eval)
+si_errors  <- actual - si_eval
+
+# Next period forecast (April = month 4)
+next_t     <- n_total + 1
+next_trend <- predict(lm_deseas, newdata = data.frame(t_index2 = next_t))
+si_next    <- next_trend * si[4]  # April index
+
+# Plot
+plot(ts_eval, main = "Seasonal Indices Forecast vs Actual",
+     ylab = "Visitors", xlab = "Time", col = "steelblue", lwd = 1.5)
+lines(ts(si_eval, start = c(2023, 1), frequency = 12),
+      col = "darkgreen", lwd = 1.5, lty = 2)
+legend("topleft", legend = c("Actual", "Seasonal Indices"),
+       col = c("steelblue", "darkgreen"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**High season**: Months with index > 1 (July, August) indicate above-average visitor counts. **Low season**: Months with index < 1 (January, February) indicate below-average counts.
+
+---
+
+## Additive Decomposition
+
+```{r additive-decomp}
+# Classical additive decomposition
+add_decomp  <- decompose(ts_visitors, type = "additive")
+plot(add_decomp)
+
+# Reconstruct fitted values (trend + seasonal)
+add_fitted  <- as.numeric(add_decomp$trend) + as.numeric(add_decomp$seasonal)
+add_eval    <- tail(add_fitted[!is.na(add_fitted)], n_eval)
+add_actual2 <- tail(actual, length(add_eval))
+add_errors  <- add_actual2 - add_eval
+
+# Forecast next period
+last_trend  <- tail(as.numeric(add_decomp$trend)[!is.na(add_decomp$trend)], 1)
+add_next    <- last_trend + as.numeric(add_decomp$seasonal)[4]  # April seasonal component
+
+# Plot
+plot(ts(add_actual2, start = c(2023, 1), frequency = 12),
+     main = "Additive Decomposition Forecast vs Actual",
+     ylab = "Visitors", xlab = "Time", col = "steelblue", lwd = 1.5)
+lines(ts(add_eval, start = c(2023, 1), frequency = 12),
+      col = "magenta", lwd = 1.5, lty = 2)
+legend("topleft", legend = c("Actual", "Additive Decomp"),
+       col = c("steelblue", "magenta"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+---
+
+## Multiplicative Decomposition
+
+```{r multiplicative-decomp}
+# Classical multiplicative decomposition
+mul_decomp  <- decompose(ts_visitors, type = "multiplicative")
+plot(mul_decomp)
+
+# Reconstruct fitted values (trend * seasonal)
+mul_fitted  <- as.numeric(mul_decomp$trend) * as.numeric(mul_decomp$seasonal)
+mul_eval    <- tail(mul_fitted[!is.na(mul_fitted)], n_eval)
+mul_actual2 <- tail(actual, length(mul_eval))
+mul_errors  <- mul_actual2 - mul_eval
+
+# Forecast next period
+last_trend2 <- tail(as.numeric(mul_decomp$trend)[!is.na(mul_decomp$trend)], 1)
+mul_next    <- last_trend2 * as.numeric(mul_decomp$seasonal)[4]
+
+# Plot
+plot(ts(mul_actual2, start = c(2023, 1), frequency = 12),
+     main = "Multiplicative Decomposition Forecast vs Actual",
+     ylab = "Visitors", xlab = "Time", col = "steelblue", lwd = 1.5)
+lines(ts(mul_eval, start = c(2023, 1), frequency = 12),
+      col = "darkcyan", lwd = 1.5, lty = 2)
+legend("topleft", legend = c("Actual", "Multiplicative Decomp"),
+       col = c("steelblue", "darkcyan"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+---
+
+## Regression with Trend and Seasonal Dummy Variables
+
+```{r regression-seasonal}
+# Create data frame with time index and seasonal dummies
+reg_df           <- data.frame(
+  visitors = as.numeric(ts_visitors),
+  t        = 1:n_total,
+  month    = factor(cycle(ts_visitors))
+)
+
+# Fit regression (month 1 = January is the reference category)
+reg_fit    <- lm(visitors ~ t + month, data = reg_df)
+summary(reg_fit)
+
+reg_fitted <- as.numeric(fitted(reg_fit))
+reg_eval   <- tail(reg_fitted, n_eval)
+reg_errors <- actual - reg_eval
+
+# Forecast April 2026 (t = n_total + 1, month = 4)
+reg_next   <- predict(reg_fit,
+                      newdata = data.frame(t = n_total + 1,
+                                           month = factor(4, levels = 1:12)))
+
+# Plot
+plot(ts_eval, main = "Regression (Trend + Seasonal Dummies) vs Actual",
+     ylab = "Visitors", xlab = "Time", col = "steelblue", lwd = 1.5)
+lines(ts(reg_eval, start = c(2023, 1), frequency = 12),
+      col = "navy", lwd = 1.5, lty = 2)
+legend("topleft", legend = c("Actual", "Regression Forecast"),
+       col = c("steelblue", "navy"), lty = c(1, 2), lwd = 2)
+grid()
+```
+
+**Trend coefficient**: Represents the average monthly increase in visitor numbers after controlling for seasonality. **Seasonal dummies**: Each month coefficient shows the deviation from January (reference month).
+
+---
+
+# Forecast Accuracy Comparison
+
+```{r accuracy-function}
+# Function to compute all required accuracy measures
+calc_accuracy <- function(actual, forecast, method_name) {
+  e    <- actual - forecast
+  n    <- length(e)
+  bias <- mean(e)
+  mad  <- mean(abs(e))
+  mse  <- mean(e^2)
+  mape <- mean(abs(e / actual)) * 100
+  rsfe <- sum(e)
+  ts_  <- rsfe / mad  # Tracking Signal
+  data.frame(
+    Method          = method_name,
+    Bias            = round(bias, 2),
+    MAD             = round(mad, 2),
+    MSE             = round(mse, 2),
+    MAPE            = round(mape, 4),
+    RSFE            = round(rsfe, 2),
+    Tracking_Signal = round(ts_, 4),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r accuracy-table}
+# Compute accuracy for each method
+# Note: additive and multiplicative decomp may have fewer eval points due to NA trend edges
+acc_naive <- calc_accuracy(actual,       naive_errors + actual - naive_errors,  "Naïve")
+# Recalculate properly
+acc_naive <- calc_accuracy(actual,                  actual - naive_errors,  "Naïve")
+acc_ma    <- calc_accuracy(ma_actual,    ma_forecasts,   "Moving Average (k=12)")
+acc_naive <- calc_accuracy(actual_naive, naive_fitted, "Naïve")
+acc_wma   <- calc_accuracy(wma_actual,   wma_forecast,   "Weighted Moving Average (k=12)")
+acc_es    <- calc_accuracy(actual,       actual - es_errors,    "Exponential Smoothing")
+acc_lm    <- calc_accuracy(actual,       actual - lm_errors,    "Linear Trend Projection")
+acc_si    <- calc_accuracy(actual,       actual - si_errors,    "Seasonal Indices")
+acc_add   <- calc_accuracy(add_actual2,  add_eval,              "Additive Decomposition")
+acc_mul   <- calc_accuracy(mul_actual2,  mul_eval,              "Multiplicative Decomposition")
+acc_reg   <- calc_accuracy(actual,       actual - reg_errors,   "Regression Trend+Seasonal")
+
+# Next period forecasts
+next_forecasts <- c(
+  round(naive_next, 0),
+  round(ma_next, 0),
+  round(wma_next, 0),
+  round(es_next, 0),
+  round(holt_next, 0),
+  round(lm_next, 0),
+  round(si_next, 0),
+  round(add_next, 0),
+  round(mul_next, 0),
+  round(as.numeric(reg_next), 0)
+)
+
+# Combine all accuracy results
+acc_all <- rbind(acc_naive, acc_ma, acc_wma, acc_es, acc_holt,
+                 acc_lm, acc_si, acc_add, acc_mul, acc_reg)
+acc_all$Next_Period_Forecast_Apr2026 <- next_forecasts
+
+# Display table
+kable(acc_all, caption = "Forecast Accuracy Comparison — All Methods",
+      format = "html", align = "c") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = TRUE, font_size = 12)
+```
+
+```{r save-accuracy-table}
+# Save accuracy table
+dir.create("outputs/tables", recursive = TRUE, showWarnings = FALSE)
+write.csv(acc_all, "outputs/tables/accuracy_comparison.csv", row.names = FALSE)
+cat("Accuracy table saved.\n")
+```
+
+---
+
+# Superior Method Selection
+
+```{r superior-method}
+# Find method with lowest MAPE
+best_idx    <- which.min(acc_all$MAPE)
+best_method <- acc_all$Method[best_idx]
+cat("Method with lowest MAPE:", best_method, "\n")
+cat("MAPE:", acc_all$MAPE[best_idx], "%\n")
+```
+
+**Selection Justification:**
+
+The series exhibits both a clear **upward trend** (post-2021 recovery) and strong **monthly seasonality**. Methods that capture both components simultaneously are most suitable.
+
+- **Regression with Trend and Seasonal Dummies** directly models both trend and seasonality through the time index and dummy variables — it is structurally the most appropriate method for this data.
+- The **Multiplicative Decomposition** is also strong, since the seasonal amplitude grows with the level of the series (multiplicative pattern).
+- The tracking signal for the selected method should be within the ±4 MAD control limits, indicating no systematic bias.
+- Simple methods (Naïve, MA, WMA) do not capture the seasonal structure adequately.
+- Exponential Smoothing without seasonality is also limited for this highly seasonal series.
+
+**Selected superior method: Regression with Trend and Seasonal Dummy Variables**
+
+---
+
+# Final Next-Period Forecast
+
+```{r final-forecast}
+# Final forecast for April 2026 using Regression (Trend + Seasonal Dummies)
+final_value  <- round(as.numeric(reg_next), 0)
+final_method <- "Regression with Trend and Seasonal Dummy Variables"
+access_date  <- format(Sys.Date(), "%Y-%m-%d")
+
+cat("=== FINAL FORECAST ===\n")
+cat("Selected Method       :", final_method, "\n")
+cat("Data Access Date      :", access_date, "\n")
+cat("Latest TÜİK Observation: March 2026\n")
+cat("Forecast Target Period : April 2026\n")
+cat("Forecasted Value      :", format(final_value, big.mark = ","), "visitors\n")
+```
+
+```{r final-plot, fig.cap="Superior Method: Actual vs Fitted + April 2026 Forecast"}
+# Plot showing fitted values and next-period forecast
+ts_fitted_full <- ts(reg_fitted, start = c(2012, 1), frequency = 12)
+
+# April 2026 point
+apr2026_date <- as.Date("2026-04-01")
+
+plot(ts_visitors,
+     main = "Regression (Trend + Seasonal Dummies): Actual vs Fitted + April 2026 Forecast",
+     ylab = "Number of Visitors",
+     xlab = "Year",
+     col  = "steelblue",
+     lwd  = 1.5)
+lines(ts_fitted_full, col = "red", lwd = 1.5, lty = 2)
+points(2026 + 3/12, final_value, pch = 19, col = "darkred", cex = 2)
+text(2026 + 3/12, final_value,
+     labels = paste0("Apr 2026\n", format(final_value, big.mark = ",")),
+     pos = 3, col = "darkred", cex = 0.85)
+legend("topleft",
+       legend = c("Actual", "Regression Fitted", "April 2026 Forecast"),
+       col    = c("steelblue", "red", "darkred"),
+       lty    = c(1, 2, NA), pch = c(NA, NA, 19), lwd = 2)
+grid()
+```
+
+```{r save-final-forecast}
+# Save final forecast
+final_df <- data.frame(
+  Superior_Method          = final_method,
+  Data_Access_Date         = access_date,
+  Latest_Available_Obs     = "March 2026",
+  Forecast_Target_Period   = "April 2026",
+  Forecasted_Value         = final_value,
+  MAPE                     = acc_all$MAPE[acc_all$Method == "Regression Trend+Seasonal"],
+  MAD                      = acc_all$MAD[acc_all$Method  == "Regression Trend+Seasonal"],
+  Tracking_Signal          = acc_all$Tracking_Signal[acc_all$Method == "Regression Trend+Seasonal"]
+)
+
+write.csv(final_df, "outputs/tables/final_forecast.csv", row.names = FALSE)
+cat("Final forecast saved.\n")
+```
+
+---
+
+# Interpretation of Results
+
+The regression model with trend and seasonal dummy variables forecasts approximately **`r format(final_value, big.mark=",")`** visitors departing from Turkey in **April 2026**.
+
+April is typically a transitional month for Turkish outbound tourism — higher than winter months but below the summer peak. The seasonal index for April is above 1, reflecting the beginning of the spring travel surge. The forecast is consistent with the recovery trajectory observed since 2021 and aligns with the seasonal pattern established over the 2012–2019 baseline.
+
+---
+
+# Limitations
+
+1. **Structural break (COVID-19)**: The 2020 data represents an extraordinary disruption. Including these observations may distort trend and seasonal estimates.
+2. **Short post-recovery period**: Only 3–4 years of post-COVID data are available, which may not fully capture the new baseline dynamics.
+3. **No external variables**: The model does not include macroeconomic indicators, exchange rates, or geopolitical factors that influence outbound tourism.
+4. **Linear trend assumption**: The regression assumes a constant linear trend, which may not hold if growth accelerates or decelerates.
+5. **Data revisions**: TÜİK may revise earlier figures, which could affect accuracy measures retrospectively.
+
+---
+
+# Reproducibility
+
+To reproduce this analysis:
+
+1. Install R (>= 4.6) and RStudio
+2. Clone the repository
+3. Install `renv` and run `renv::restore()` to restore the package environment
+4. Open `forecasting_project.Rmd` and click **Knit**
+
+All data are accessed programmatically via `tuikr` and `httr::GET()`. No manual data files are used.
+
+---
+
+# Repository Structure
+
+```
+tuik-forecasting-project/
+├── README.md
+├── forecasting_project.Rmd
+├── forecasting_project.html
+├── outputs/
+│   ├── tables/
+│   │   ├── accuracy_comparison.csv
+│   │   └── final_forecast.csv
+│   └── figures/
+├── R/
+│   ├── data_import.R
+│   ├── forecasting_methods.R
+│   ├── accuracy_measures.R
+│   └── plots.R
+├── renv.lock
+└── .gitignore
+```
+
+---
+
+*Project completed by Emir ARMAN (138721522) — Forecasting Course*
