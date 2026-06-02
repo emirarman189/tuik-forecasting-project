@@ -21,7 +21,7 @@ This project was developed as part of the Quantitative Analysis For Decision Mak
 This project aims to forecast the number of Turkish citizens departing abroad on a monthly basis. Outbound tourism is a meaningful indicator of consumer confidence, purchasing power, and overall economic activity in Turkey. Understanding and forecasting this variable can provide useful insights for tourism-related planning and policy. The forecast is produced for April 2026, using all available historical data up to March 2026.
 
 ## 4. Use of TÜİK Data in R
-Data were accessed programmatically using the `tuikr` package to obtain the table URL, and `httr::GET()` to download the file. No manual data download or preparation was performed.
+Data were accessed programmatically using the `tuikr` package to obtain the relevant table URL, and `httr::GET()` to download the file directly into R. The imported data were then filtered to select the target variable, arranged chronologically, and checked for missing values and irregular observations. No manual data download, copy-paste, or external file preparation was performed at any stage. All filtering, formatting, and time series structuring were carried out exclusively within the R notebook through reproducible code.
 
 ## 5. Exploratory Time Series Analysis
 - Strong upward trend (2012-2019), sharp COVID-19 disruption in 2020, strong recovery from 2021
