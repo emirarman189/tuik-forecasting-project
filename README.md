@@ -1,7 +1,7 @@
 # TÜİK Forecasting Project
 
 ## 1. Project Overview
-This project forecasts the monthly number of visitors departing from Turkey using data from the TÜİK Data Portal, accessed via the `tuikr` R package.
+This project was developed as part of the Quantitative Analysis For Decision Making course. The aim is to forecast the monthly number of Turkish citizens departing abroad using real time series data obtained directly from the TÜİK Data Portal via the `tuikr` R package. Multiple forecasting methods were applied and compared, and the superior method was selected based on accuracy measures and data structure. The final forecast covers April 2026, the next period after the latest available TÜİK observation.
 
 ## 2. Data Source and TÜİK Connection
 - TÜİK Data Set Name: Tourism expenditures, number of visitors and average expenditure per capita by months
@@ -14,6 +14,7 @@ This project forecasts the monthly number of visitors departing from Turkey usin
 - Latest Available Observation: March 2026
 - Forecast Target Period: April 2026
 - Data Access Method: tuikr + httr::GET()
+- Date of Data Access: June 2026
 - Package Source: https://github.com/emraher/tuikr
 
 ## 3. Research Objective
@@ -47,6 +48,7 @@ Regression with Trend and Seasonal Dummy Variables was selected as the superior 
 
 ## 9. Final Next-Period Forecast
 - Superior Method: Regression with Trend and Seasonal Dummy Variables
+- Date of Data Access: June 2026
 - Latest Available Observation: March 2026
 - Forecast Target Period: April 2026
 - See outputs/tables/final_forecast.csv for the forecasted value
@@ -81,5 +83,5 @@ tuik-forecasting-project/
 ## 14. Author
 - Student Name: Emir ARMAN
 - Student Number: 138721522
-- Course: Forecasting
+- Course: Quantitative Analysis For Decision Making
 
