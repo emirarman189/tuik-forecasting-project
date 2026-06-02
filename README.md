@@ -24,9 +24,7 @@ This project aims to forecast the number of Turkish citizens departing abroad on
 Data were accessed programmatically using the `tuikr` package to obtain the relevant table URL, and `httr::GET()` to download the file directly into R. The imported data were then filtered to select the target variable, arranged chronologically, and checked for missing values and irregular observations. No manual data download, copy-paste, or external file preparation was performed at any stage. All filtering, formatting, and time series structuring were carried out exclusively within the R notebook through reproducible code.
 
 ## 5. Exploratory Time Series Analysis
-- Strong upward trend (2012-2019), sharp COVID-19 disruption in 2020, strong recovery from 2021
-- Clear monthly seasonality (peaks in summer, troughs in winter)
-- No missing values in the selected period
+The selected series displays a strong upward trend between 2012 and 2019, reflecting the steady growth in Turkish outbound tourism during that period. A sharp structural break occurred in early 2020 due to the COVID-19 pandemic, causing a dramatic drop in visitor numbers. Recovery began in 2021 and continued strongly through 2022 and beyond. Clear monthly seasonality is present throughout the series, with peaks typically occurring in summer months and troughs in winter. No missing values or duplicate periods were detected in the selected time range.
 
 ## 6. Forecasting Methods Applied
 - Naive Forecasting
